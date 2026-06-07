@@ -30,46 +30,45 @@ from __future__ import annotations
 
 import importlib
 import logging
+import random
+import string
+import time
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
-    pass
+    from deebot_client.event_bus import EventBus
 
 _LOGGER = logging.getLogger(__name__)
 DOMAIN = "deebot_mower_fix"
 
+# HA-configured timezone (IANA name, e.g. "America/New_York").
+# Set from hass.config.time_zone in async_setup before any commands are issued.
+# The firmware uses tzc to evaluate protection-window times in local time.
+# Without it, the firmware defaults to UTC, which blocks mowing during US evenings
+# when the UTC time falls inside the configured animal-protection window.
+_HA_TIMEZONE: str = "UTC"
+
 # ---------------------------------------------------------------------------
-# GOAT mower device classes grouped by required payload format.
+# GOAT mower device classes.
 #
-# V1-flat family (5xu9h3 / O1000 LiDAR Pro and variants):
-#   Firmware accepts the legacy clean topic AND the legacy flat payload:
-#   START  → {"act": "start", "type": "auto"}
-#   PAUSE  → {"act": "pause"}
-#   STOP   → {"act": "stop"}
-#   RESUME → {"act": "resume"}
-#
-# V2-content family (xmp9ds A1600 RTK, 300lc5, 51rcxt):
-#   Firmware accepts the legacy clean topic with a V2 nested payload:
+# All families use the legacy ``clean`` topic with the app-compatible header
+# (ver=0.0.22) and V2 nested payload:
 #   START  → {"act": "start",  "content": {"type": "auto"}}
 #   PAUSE  → {"act": "pause",  "content": {"type": "auto"}}
 #   STOP   → {"act": "stop",   "content": {"type": "auto"}}
 #   RESUME → {"act": "resume", "content": {"type": "auto"}}
+#
+# Root cause of code 20003 "unknow type": the library sends ver="0.0.50"
+# but the firmware parser keyed on ver="0.0.22" (what the official app sends).
 # ---------------------------------------------------------------------------
 
-# Uses flat V1 payload (no nested content object)
-_GOAT_V1_CLASSES: tuple[str, ...] = (
+_GOAT_CLASSES: tuple[str, ...] = (
+    # 5xu9h3 family (O1000 LiDAR PRO and close relatives)
     "5xu9h3", "0jbd6s", "2ap5uq", "2i0fns", "6n9pcz", "77atlz",
     "9bts2s", "aadham", "ao7fpq", "bfvvk", "qhq6i0", "s69g6z", "wwswjm",
+    # A1600 RTK / other confirmed GOAT families
+    "xmp9ds", "300lc5", "6cibhb", "51rcxt", "2px96q",
 )
-
-# Uses V2 nested content payload (confirmed by MQTT traces in issue #852)
-_GOAT_V2_CLASSES: tuple[str, ...] = (
-    "xmp9ds",
-    "300lc5", "6cibhb",
-    "51rcxt", "2px96q",
-)
-
-_GOAT_CLASSES: tuple[str, ...] = _GOAT_V1_CLASSES + _GOAT_V2_CLASSES
 
 
 # ---------------------------------------------------------------------------
@@ -114,29 +113,69 @@ def _apply_patch() -> None:
         except ImportError:
             pass
 
-    # CleanMower uses V2 nested payload: {"act": "start", "content": {"type": "auto"}}
-    # CleanMowerFlat uses V1 flat payload: {"act": "start", "type": "auto"} (no content wrapper)
-    # The O1000 LiDAR Pro (5xu9h3 family) rejects the nested format with code 20003.
-    _clean_mower_v2 = clean_mod.CleanMower
-    _base_clean_for_flat = clean_mod.Clean
+    # Root-cause fix: firmware uses ver field to select parser.
+    # ver="0.0.50" (library default) → old parser → rejects type field → 20003.
+    # ver="0.0.22" (official app)    → current parser → accepts normally.
+    # All GOAT classes get _CleanMowerNG: V2 nested payload + app-compatible header.
+    #
+    # IMPORTANT: base on CleanMower (not Clean) so we inherit its _get_args which
+    # produces V2 nested format.  Clean._get_args ignores _v2_args and always
+    # produces flat V1, which is what was sent in the previous broken attempt.
+    _base_for_ng = clean_mod.CleanMower  # guaranteed by Step 1
 
-    class _CleanMowerFlat(_base_clean_for_flat):  # type: ignore[misc,valid-type]
-        """Clean command with minimal payload for 5xu9h3-family GOAT firmware.
+    class _CleanMowerNG(_base_for_ng):  # type: ignore[misc,valid-type]
+        """Clean command for GOAT mowers with app-compatible protocol header.
 
-        The O1000 LiDAR Pro and related devices reject ANY type field
-        (flat or nested) with code 20003 "unknow type".  Sending just the
-        action verb with no type resolves this:
-          START  -> {"act": "start"}
-          PAUSE  -> {"act": "pause"}
-          STOP   -> {"act": "stop"}
-          RESUME -> {"act": "resume"}
+        Overrides _get_payload to send the same header the official Ecovacs
+        Android app uses (ver=0.0.22, pri=2 int, ts=ms-string, channel, m,
+        reqid).  Without this the firmware parser (keyed on ver) rejects the
+        command with code 20003 "unknow type" regardless of the body payload.
+
+        Also overrides _get_args to guarantee V2 nested payload regardless of
+        the base CleanMower implementation (the stub we inject in Step 1 does
+        not override _get_args, so it would inherit the flat V1 format from
+        Clean._get_args).
+
+        Uses V2 nested payload:
+          START  → {"act": "start",  "content": {"type": "auto"}}
+          PAUSE  → {"act": "pause",  "content": {"type": "auto"}}
+          STOP   → {"act": "stop",   "content": {"type": "auto"}}
+          RESUME → {"act": "resume", "content": {"type": "auto"}}
         """
 
-        _v2_args: ClassVar[bool] = False
+        _v2_args: ClassVar[bool] = True
 
         def _get_args(self, action: Any) -> dict[str, Any]:
-            # Strip the type field entirely — firmware rejects it with 20003.
-            return {"act": action.value}
+            # Explicit V2 nested payload — do NOT rely on base _get_args since
+            # Clean._get_args produces flat V1 and our injected CleanMower stub
+            # also inherits that behaviour.
+            return {"act": action.value, "content": {"type": "auto"}}
+
+        def _get_payload(self) -> dict[str, Any] | list[Any]:
+            import datetime as _dt
+            reqid = "".join(random.choices(string.ascii_letters + string.digits, k=6))
+            ts_ms = str(int(time.time() * 1000))
+            # Calculate current UTC offset in minutes dynamically (handles DST).
+            utc_offset = _dt.datetime.now().astimezone().utcoffset()
+            tzm = int((utc_offset.total_seconds() if utc_offset else 0) / 60)
+            # Body MUST come before header — the mower firmware JSON parser
+            # is position-sensitive and expects this exact ordering.
+            # tzc is required: without it the firmware evaluates protection
+            # windows in UTC, blocking mowing when UTC falls inside the window.
+            payload: dict[str, Any] = {}
+            if self._args:
+                payload["body"] = {"data": self._args}
+            payload["header"] = {
+                "channel": "Android",
+                "m": "request",
+                "pri": 2,
+                "reqid": reqid,
+                "ts": ts_ms,
+                "tzc": _HA_TIMEZONE,
+                "tzm": tzm,
+                "ver": "0.0.22",
+            }
+            return payload
 
     get_clean_info = getattr(clean_mod, "GetCleanInfo", None)
 
@@ -152,56 +191,83 @@ def _apply_patch() -> None:
 
     patched = 0
     already_fixed = 0
+    missing_classes: list[str] = []  # classes with no installed hardware module
+
     for class_ in _GOAT_CLASSES:
         not_found_cache.discard(class_)
-
-        # Choose the right CleanMower variant for this hardware family:
-        # V1-flat families (5xu9h3/O1000 etc.) use the flat payload to avoid
-        # firmware error 20003 "unknow type" caused by the nested content object.
-        clean_cmd = _CleanMowerFlat if class_ in _GOAT_V1_CLASSES else _clean_mower_v2
 
         try:
             mod = importlib.import_module(f"deebot_client.hardware.{class_}")
         except ModuleNotFoundError:
-            _LOGGER.debug("No hardware module for class %s; skipping", class_)
+            _LOGGER.debug("No hardware module for class %s; will alias later", class_)
+            missing_classes.append(class_)
             continue
 
         changed = False
 
-        # Replace CleanV2 → variant (older hardware files that still use CleanV2).
+        # Replace CleanV2 → _CleanMowerNG (older hardware files using CleanV2).
         if getattr(mod, "CleanV2", None) is not None:
-            mod.CleanV2 = clean_cmd  # type: ignore[attr-defined]
+            mod.CleanV2 = _CleanMowerNG  # type: ignore[attr-defined]
             changed = True
 
-        # Replace CleanMower → variant (newer hardware files like 0jbd6s.py
-        # that already import CleanMower directly).  Without this the patch
-        # is a silent no-op on those modules.
+        # Replace CleanMower → _CleanMowerNG (newer hardware files).
         if getattr(mod, "CleanMower", None) is not None:
-            mod.CleanMower = clean_cmd  # type: ignore[attr-defined]
+            mod.CleanMower = _CleanMowerNG  # type: ignore[attr-defined]
             changed = True
 
-        # Replace GetCleanInfoV2 → GetCleanInfo so state polling uses the
-        # correct topic.
+        # Replace GetCleanInfoV2 → GetCleanInfo so state polling works.
         if getattr(mod, "GetCleanInfoV2", None) is not None and get_clean_info:
             mod.GetCleanInfoV2 = get_clean_info  # type: ignore[attr-defined]
             changed = True
 
         if changed:
-            # Evict any stale cached entry and rebuild with the patched module
             devices_cache.pop(class_, None)
             devices_cache[class_] = mod.get_device_info()
             patched += 1
-            _LOGGER.info(
-                "deebot_mower_fix: patched %s with %s payload (clean_cmd=%s)",
+            _LOGGER.warning(
+                "deebot_mower_fix: patched %s with app-header V2 payload",
                 class_,
-                "flat-V1" if class_ in _GOAT_V1_CLASSES else "nested-V2",
-                clean_cmd.__name__,
             )
         else:
+            _LOGGER.warning(
+                "deebot_mower_fix: skipped %s — no CleanV2 or CleanMower found in module",
+                class_,
+            )
             already_fixed += 1
 
-    _LOGGER.info(
-        "deebot_mower_fix: done — %d class(es) patched, %d already correct",
+    # ── Step 3: alias classes that had no hardware module to 5xu9h3 ────────────
+    # Some installed deebot_client versions lack hardware files for newer models
+    # (e.g. 0jbd6s / O1000 LiDAR PRO).  Alias them to the patched 5xu9h3 entry.
+    if missing_classes:
+        try:
+            family_mod = importlib.import_module("deebot_client.hardware.5xu9h3")
+            # Patch 5xu9h3 itself so the aliased entry carries the new class
+            if getattr(family_mod, "CleanMower", None) is not None:
+                family_mod.CleanMower = _CleanMowerNG  # type: ignore[attr-defined]
+            elif getattr(family_mod, "CleanV2", None) is not None:
+                family_mod.CleanV2 = _CleanMowerNG  # type: ignore[attr-defined]
+            if getattr(family_mod, "GetCleanInfoV2", None) is not None and get_clean_info:
+                family_mod.GetCleanInfoV2 = get_clean_info  # type: ignore[attr-defined]
+            devices_cache.pop("5xu9h3", None)
+            family_info = family_mod.get_device_info()
+            devices_cache["5xu9h3"] = family_info
+            for class_ in missing_classes:
+                devices_cache[class_] = family_info
+                not_found_cache.discard(class_)
+                patched += 1
+                _LOGGER.warning(
+                    "deebot_mower_fix: aliased %s → 5xu9h3 family (app-header V2 payload)",
+                    class_,
+                )
+        except (ModuleNotFoundError, AttributeError) as alias_err:
+            _LOGGER.warning(
+                "deebot_mower_fix: could not alias missing classes (%s) — %s",
+                ", ".join(missing_classes),
+                alias_err,
+            )
+
+    _LOGGER.warning(
+        "deebot_mower_fix: done — %d class(es) patched/aliased, %d skipped",
         patched,
         already_fixed,
     )
@@ -213,6 +279,12 @@ def _apply_patch() -> None:
 
 async def async_setup(hass: Any, config: Any) -> bool:
     """Set up the deebot_mower_fix component and apply the patch."""
+    global _HA_TIMEZONE
+    _HA_TIMEZONE = getattr(hass.config, "time_zone", "UTC") or "UTC"
+    _LOGGER.warning(
+        "deebot_mower_fix: using timezone %s for clean command headers",
+        _HA_TIMEZONE,
+    )
     _LOGGER.info("deebot_mower_fix: starting up, applying CleanMower patch …")
     await hass.async_add_executor_job(_apply_patch)
 
